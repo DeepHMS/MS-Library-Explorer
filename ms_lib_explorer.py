@@ -1,6 +1,7 @@
 #############################
 # PASEF MAPPER STREAMLIT #
-# With Google Drive + Local Upload
+# Google Drive + Local Upload (<200 MB)
+# Auto-Column Rename + Robust Parsing
 #############################
 import io
 import re
@@ -45,20 +46,18 @@ def download_from_google_drive(file_id: str) -> bytes:
     URL = f"https://drive.google.com/uc?export=download&id={file_id}"
     session = requests.Session()
     response = session.get(URL, stream=True)
-    
-    # Handle virus scan warning
+
+    # Handle large-file virus-scan warning
     confirm_token = None
     for key, value in response.cookies.items():
         if key.startswith("download_warning"):
             confirm_token = value
             break
-    
     if confirm_token:
         response = session.get(URL + f"&confirm={confirm_token}", stream=True)
-    
+
     if response.status_code != 200:
-        raise RuntimeError(f"Download failed (status {response.status_code}). Check link & permissions.")
-    
+        raise RuntimeError(f"Download failed (status {response.status_code}). Check permissions.")
     return response.content
 
 # ---------------------------------------------------------
@@ -72,14 +71,14 @@ def parse_unimods(df, selected_unimods=None):
         lambda x: tuple(sorted(set(re.findall(pattern, x))))
     )
     all_unis = sorted({u for x in df["UniMod_List"] for u in x})
-    
+
     if selected_unimods is None:
         # Default: top 3 most frequent
-        top3 = (df["UniMod_List"].explode().value_counts().head(3).index.tolist())
+        top3 = df["UniMod_List"].explode().value_counts().head(3).index.tolist()
         selected_unimods = set(top3) if top3 else set()
-    
+
     df["Has_Mod"] = df["UniMod_List"].apply(lambda x: bool(set(x) & selected_unimods))
-    return df, all_unis
+    return df, all_unis, selected_unimods
 
 def parse_pasef_windows_txt_bytes(txt_bytes: bytes, pasef_type: str):
     dia_windows, diag_windows = [], []
@@ -126,8 +125,8 @@ def draw_windows(ax, overlay, pasef_type, dia_windows, diag_windows):
         draw_diag(ax, diag_windows)
 
 def make_colormap(selected_unimods):
-    base_colors = ["blue","orange","green","purple","gold","cyan","brown","pink","gray","olive"]
-    return {u: base_colors[i % len(base_colors)] for i,u in enumerate(sorted(selected_unimods))}
+    colors = ["blue","orange","green","purple","gold","cyan","brown","pink","gray","olive"]
+    return {u: colors[i % len(colors)] for i, u in enumerate(sorted(selected_unimods))}
 
 def plot_panel(ax, data, title, xlim, ylim,
                show_nonuni, show_unimod, selected_unimods,
@@ -137,7 +136,7 @@ def plot_panel(ax, data, title, xlim, ylim,
         nonu = data[~data["Has_Mod"]]
         ax.scatter(nonu["PrecursorMz"], nonu["PrecursorIonMobility"],
                    color="grey", alpha=0.12, s=8)
-    if show_unimod:
+    if show_unimod and selected_unimods:
         cmap = make_colormap(selected_unimods)
         for u in selected_unimods:
             sub = data[data["UniMod_List"].apply(lambda x: u in x)]
@@ -148,13 +147,13 @@ def plot_panel(ax, data, title, xlim, ylim,
     ax.set_xlim(*xlim); ax.set_ylim(*ylim)
     ax.set_title(title, fontsize=12)
     ax.set_xlabel("Precursor m/z")
-    ax.set_ylabel("Ion Mobility (1/K0)")
+    ax.set_ylabel("Ion Mobility (1/K₀)")
 
 # ---------------------------------------------------------
-# UI: File Input Method Selection
+# UI: Input Method
 # ---------------------------------------------------------
 st.title("PASEF Mapper — Visualize DIA-PASEF Libraries")
-st.write("Upload local file **< 200 MB** or use **Google Drive shareable link** for larger files.")
+st.write("**Local Upload** (< 200 MB) or **Google Drive** (any size).")
 
 input_method = st.radio(
     "Choose input method:",
@@ -181,23 +180,22 @@ if input_method == "Local Upload (< 200 MB)":
     if lib_file is not None:
         size_mb = lib_file.size / (1024*1024)
         if size_mb > MAX_UPLOAD_MB:
-            st.error(f"File too large ({size_mb:.1f} MB). Use Google Drive method.")
+            st.error(f"File too large ({size_mb:.1f} MB). Use Google Drive.")
             st.stop()
         st.success(f"Uploaded ({size_mb:.1f} MB)")
         raw = lib_file.read()
         sep = autodetect_sep(raw[:2000])
         df = pd.read_csv(io.BytesIO(raw), sep=sep, dtype=dtypes, engine='c')
-        st.write("Preview:", df.head())
 
 # -------------------------------
 # 2. Google Drive
 # -------------------------------
 else:
-    gd_link = st.text_input("Paste Google Drive **shareable link** (Anyone with link → Viewer)")
+    gd_link = st.text_input("Paste **Google Drive shareable link** (Anyone with link → Viewer)")
     if gd_link:
         file_id = extract_drive_file_id(gd_link)
         if not file_id:
-            st.error("Invalid Google Drive link. Use format: `.../d/FILE_ID/...` or `?id=FILE_ID`")
+            st.error("Invalid link. Use format: `.../d/FILE_ID/...` or `?id=FILE_ID`")
             st.stop()
         with st.spinner("Downloading from Google Drive..."):
             try:
@@ -208,22 +206,77 @@ else:
             sep = autodetect_sep(file_bytes[:2000])
             df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, dtype=dtypes, engine='c')
         st.success("Library loaded from Google Drive")
-        st.write("Preview:", df.head())
 
 # Stop if no data
 if df is None:
-    st.info("Please upload a library or provide a Google Drive link.")
+    st.info("Please upload a file or provide a Google Drive link.")
     st.stop()
+
+# ---------------------------------------------------------
+# DEBUG: Show actual column names
+# ---------------------------------------------------------
+st.subheader("Column Debug")
+st.write("**Your file columns:**")
+st.code("\n".join(df.columns.tolist()), language="text")
+
+# ---------------------------------------------------------
+# AUTO-RENAME COMMON VARIANTS
+# ---------------------------------------------------------
+rename_map = {
+    # Protein
+    'Protein': 'ProteinId', 'ProteinName': 'ProteinId', 'Protein.ID': 'ProteinId',
+    'LeadingProtein': 'ProteinId', 'ProteinAccession': 'ProteinId',
+
+    # m/z
+    'PrecursorMZ': 'PrecursorMz', 'm/z': 'PrecursorMz', 'Precursor Mz': 'PrecursorMz',
+    'Precursor.Mz': 'PrecursorMz', 'MZ': 'PrecursorMz',
+
+    # Peptide
+    'Sequence': 'PeptideSequence', 'StrippedSequence': 'PeptideSequence',
+    'StrippedPeptide': 'PeptideSequence', 'Modified Sequence': 'ModifiedPeptideSequence',
+
+    # Modified Peptide
+    'Modified Sequence': 'ModifiedPeptideSequence', 'FullPeptideName': 'ModifiedPeptideSequence',
+    'ModifiedPeptide': 'ModifiedPeptideSequence', 'LabeledPeptide': 'ModifiedPeptideSequence',
+
+    # Ion Mobility
+    'IonMobility': 'PrecursorIonMobility', 'IM': 'PrecursorIonMobility',
+    '1/K0': 'PrecursorIonMobility', 'Mobility': 'PrecursorIonMobility',
+
+    # Charge
+    'Charge': 'PrecursorCharge', 'PrecursorChargeState': 'PrecursorCharge',
+    'Z': 'PrecursorCharge', 'Precursor Charge': 'PrecursorCharge',
+}
+
+renamed = False
+for old, new in rename_map.items():
+    if old in df.columns and new not in df.columns:
+        df.rename(columns={old: new}, inplace=True)
+        st.success(f"Renamed `{old}` → `{new}`")
+        renamed = True
+if not renamed:
+    st.info("No column renaming needed.")
 
 # ---------------------------------------------------------
 # Validate required columns
 # ---------------------------------------------------------
-req_cols = ["ProteinId","PrecursorMz","PeptideSequence",
-            "ModifiedPeptideSequence","PrecursorIonMobility","PrecursorCharge"]
+req_cols = [
+    "ProteinId", "PrecursorMz", "PeptideSequence",
+    "ModifiedPeptideSequence", "PrecursorIonMobility", "PrecursorCharge"
+]
 missing = [c for c in req_cols if c not in df.columns]
 if missing:
-    st.error(f"Missing required columns: {missing}")
+    st.error("**Missing required columns after rename:**")
+    for c in missing:
+        st.write(f"- `{c}`")
+    st.info("Check spelling, case, or extra spaces. See debug above.")
     st.stop()
+else:
+    st.success("All required columns found!")
+
+# Preview
+st.write("**Preview (first 5 rows):**")
+st.dataframe(df.head(), use_container_width=True)
 
 # ---------------------------------------------------------
 # Optional PASEF windows
@@ -234,13 +287,13 @@ pasef_type = st.radio("PASEF Type", ["DIA","DIAGONAL"], horizontal=True, disable
 dia_windows, diag_windows = [], []
 
 if overlay:
-    wopt = st.radio("Windows file source:", ["Upload (.txt)", "Google Drive"], horizontal=True)
+    wopt = st.radio("Windows source:", ["Upload (.txt)", "Google Drive"], horizontal=True)
     if wopt == "Upload (.txt)":
-        win_file = st.file_uploader("Upload windows file (.txt)", type=["txt"], key="win_local")
+        win_file = st.file_uploader("Upload windows (.txt)", type=["txt"], key="win_local")
         if win_file:
             w_bytes = win_file.read()
             dia_windows, diag_windows = parse_pasef_windows_txt_bytes(w_bytes, pasef_type)
-            st.success("Windows file loaded.")
+            st.success("Windows loaded.")
     else:
         win_link = st.text_input("Google Drive link (windows .txt)", key="win_drive")
         if win_link:
@@ -251,14 +304,14 @@ if overlay:
                 st.success("Windows loaded from Drive")
 
 # ---------------------------------------------------------
-# Plotting Controls
+# Plot Controls
 # ---------------------------------------------------------
 st.header("Plot Controls")
 c1,c2,c3,c4 = st.columns(4)
 with c1: x_min = st.number_input("m/z min", value=0.0, step=10.0)
 with c2: x_max = st.number_input("m/z max", value=1800.0, step=10.0)
-with c3: y_min = st.number_input("1/K0 min", value=0.0, step=0.1)
-with c4: y_max = st.number_input("1/K0 max", value=1.9, step=0.1)
+with c3: y_min = st.number_input("1/K₀ min", value=0.0, step=0.1)
+with c4: y_max = st.number_input("1/K₀ max", value=1.9, step=0.1)
 xlim = (x_min, x_max)
 ylim = (y_min, y_max)
 
@@ -267,7 +320,7 @@ show_nonuni = st.checkbox("Show Non-UniMod", value=True)
 show_unimod = st.checkbox("Show UniMod", value=True)
 
 # ---------------------------------------------------------
-# Prepare data subsets
+# Prepare data
 # ---------------------------------------------------------
 sub1 = ["ProteinId","PrecursorMz","PeptideSequence",
         "ModifiedPeptideSequence","PrecursorIonMobility"]
@@ -279,10 +332,10 @@ selected_unimods = set()
 all_unis = []
 
 if map_unimod:
-    df_all, all_unis = parse_unimods(df_all)
-    df_chg, _ = parse_unimods(df_chg)
+    df_all, all_unis, default_unimods = parse_unimods(df_all)
+    df_chg, _, _ = parse_unimods(df_chg)
     if all_unis:
-        selected_unimods = set(st.multiselect("Select UniMods", all_unis, default=list(selected_unimods)))
+        selected_unimods = set(st.multiselect("Select UniMods", all_unis, default=list(default_unimods)))
     df_all["Has_Mod"] = df_all["UniMod_List"].apply(lambda x: bool(set(x) & selected_unimods))
     df_chg["Has_Mod"] = df_chg["UniMod_List"].apply(lambda x: bool(set(x) & selected_unimods))
 else:
@@ -299,7 +352,7 @@ ncols = min(3, n_panels)
 nrows = math.ceil(n_panels / ncols)
 
 fig, axes = plt.subplots(nrows, ncols, figsize=(6*ncols, 4*nrows), constrained_layout=True)
-axes = np.array(axes).flatten()[:n_panels]  # Only use needed axes
+axes = np.array(axes).flatten()[:n_panels]
 
 # All precursors
 plot_panel(axes[0], df_all, "All Precursors", xlim, ylim,
@@ -322,7 +375,7 @@ st.pyplot(fig)
 plt.close(fig)  # Prevent memory leak
 
 # ---------------------------------------------------------
-# Download Button
+# Download
 # ---------------------------------------------------------
 buf = io.BytesIO()
 fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
