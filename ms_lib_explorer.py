@@ -1,7 +1,7 @@
 #############################
 # PASEF MAPPER STREAMLIT #
-# Google Drive + Local Upload (<200 MB)
-# Auto-Column Rename + Robust Parsing
+# Google Drive + Local Upload
+# FULL VIRUS SCAN BYPASS + AUTO-RENAME
 #############################
 import io
 import re
@@ -39,25 +39,39 @@ def extract_drive_file_id(url: str):
     return None
 
 # ---------------------------------------------------------
-# Download from Google Drive (Handles Virus Scan Warning)
+# Download from Google Drive (FULL VIRUS SCAN BYPASS)
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_from_google_drive(file_id: str) -> bytes:
-    URL = f"https://drive.google.com/uc?export=download&id={file_id}"
+    base_url = "https://drive.google.com/uc"
     session = requests.Session()
-    response = session.get(URL, stream=True)
 
-    # Handle large-file virus-scan warning
-    confirm_token = None
-    for key, value in response.cookies.items():
-        if key.startswith("download_warning"):
-            confirm_token = value
-            break
-    if confirm_token:
-        response = session.get(URL + f"&confirm={confirm_token}", stream=True)
+    # Step 1: Try direct download
+    response = session.get(base_url, params={"export": "download", "id": file_id}, stream=True)
+    content = response.content
+
+    # Step 2: Detect virus scan HTML page
+    if b"virus scan warning" in content.lower() or b"uc-download-link" in content:
+        text = content.decode('utf-8', errors='ignore')
+        confirm_match = re.search(r'name="confirm"\s+value="([^"]+)"', text)
+        uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', text)
+
+        if not confirm_match:
+            raise RuntimeError("Virus scan page detected but no confirm token found.")
+
+        params = {
+            "id": file_id,
+            "export": "download",
+            "confirm": confirm_match.group(1)
+        }
+        if uuid_match:
+            params["uuid"] = uuid_match.group(1)
+
+        response = session.get(base_url, params=params, stream=True)
 
     if response.status_code != 200:
-        raise RuntimeError(f"Download failed (status {response.status_code}). Check permissions.")
+        raise RuntimeError(f"Download failed: {response.status_code}")
+
     return response.content
 
 # ---------------------------------------------------------
@@ -73,7 +87,6 @@ def parse_unimods(df, selected_unimods=None):
     all_unis = sorted({u for x in df["UniMod_List"] for u in x})
 
     if selected_unimods is None:
-        # Default: top 3 most frequent
         top3 = df["UniMod_List"].explode().value_counts().head(3).index.tolist()
         selected_unimods = set(top3) if top3 else set()
 
@@ -84,7 +97,7 @@ def parse_pasef_windows_txt_bytes(txt_bytes: bytes, pasef_type: str):
     dia_windows, diag_windows = [], []
     lines = txt_bytes.decode(errors="ignore").splitlines()
     reader = csv.reader(lines)
-    next(reader, None)  # header
+    next(reader, None)
     for parts in reader:
         if not parts:
             continue
@@ -153,7 +166,7 @@ def plot_panel(ax, data, title, xlim, ylim,
 # UI: Input Method
 # ---------------------------------------------------------
 st.title("PASEF Mapper — Visualize DIA-PASEF Libraries")
-st.write("**Local Upload** (< 200 MB) or **Google Drive** (any size).")
+st.write("Supports **local upload (<200 MB)** or **Google Drive (any size)** with **virus scan bypass**.")
 
 input_method = st.radio(
     "Choose input method:",
@@ -191,25 +204,43 @@ if input_method == "Local Upload (< 200 MB)":
 # 2. Google Drive
 # -------------------------------
 else:
-    gd_link = st.text_input("Paste **Google Drive shareable link** (Anyone with link → Viewer)")
+    gd_link = st.text_input(
+        "Paste **Google Drive shareable link** (Anyone with link → Viewer)\n"
+        "**For large files (>200 MB): Open link → Click 'Download anyway' → Copy NEW URL**",
+        placeholder="https://drive.google.com/file/d/.../view"
+    )
     if gd_link:
         file_id = extract_drive_file_id(gd_link)
         if not file_id:
-            st.error("Invalid link. Use format: `.../d/FILE_ID/...` or `?id=FILE_ID`")
+            st.error("Invalid link. Must contain `/d/FILE_ID/` or `id=FILE_ID`")
             st.stop()
-        with st.spinner("Downloading from Google Drive..."):
+
+        with st.spinner("Downloading from Google Drive (bypassing virus scan)..."):
             try:
                 file_bytes = download_from_google_drive(file_id)
             except Exception as e:
                 st.error(f"Download failed: {e}")
                 st.stop()
-            sep = autodetect_sep(file_bytes[:2000])
-            df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, dtype=dtypes, engine='c')
+
+        # BLOCK HTML VIRUS PAGE
+        if b"<!DOCTYPE html>" in file_bytes[:1000] or b"virus scan warning" in file_bytes[:500].lower():
+            st.error("**Blocked**: Google Drive virus scan page received.")
+            st.info("""
+            **How to fix (30 seconds)**:
+            1. Open your link in a browser
+            2. Click **"Download anyway"**
+            3. Wait 2 seconds → Copy the **new URL from address bar**
+            4. Paste that **full URL** here
+            """)
+            st.stop()
+
+        sep = autodetect_sep(file_bytes[:2000])
+        df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, dtype=dtypes, engine='c')
         st.success("Library loaded from Google Drive")
 
 # Stop if no data
 if df is None:
-    st.info("Please upload a file or provide a Google Drive link.")
+    st.info("Please upload a file or provide a valid Google Drive link.")
     st.stop()
 
 # ---------------------------------------------------------
@@ -223,29 +254,15 @@ st.code("\n".join(df.columns.tolist()), language="text")
 # AUTO-RENAME COMMON VARIANTS
 # ---------------------------------------------------------
 rename_map = {
-    # Protein
     'Protein': 'ProteinId', 'ProteinName': 'ProteinId', 'Protein.ID': 'ProteinId',
     'LeadingProtein': 'ProteinId', 'ProteinAccession': 'ProteinId',
-
-    # m/z
     'PrecursorMZ': 'PrecursorMz', 'm/z': 'PrecursorMz', 'Precursor Mz': 'PrecursorMz',
-    'Precursor.Mz': 'PrecursorMz', 'MZ': 'PrecursorMz',
-
-    # Peptide
+    'MZ': 'PrecursorMz',
     'Sequence': 'PeptideSequence', 'StrippedSequence': 'PeptideSequence',
-    'StrippedPeptide': 'PeptideSequence', 'Modified Sequence': 'ModifiedPeptideSequence',
-
-    # Modified Peptide
     'Modified Sequence': 'ModifiedPeptideSequence', 'FullPeptideName': 'ModifiedPeptideSequence',
-    'ModifiedPeptide': 'ModifiedPeptideSequence', 'LabeledPeptide': 'ModifiedPeptideSequence',
-
-    # Ion Mobility
     'IonMobility': 'PrecursorIonMobility', 'IM': 'PrecursorIonMobility',
     '1/K0': 'PrecursorIonMobility', 'Mobility': 'PrecursorIonMobility',
-
-    # Charge
-    'Charge': 'PrecursorCharge', 'PrecursorChargeState': 'PrecursorCharge',
-    'Z': 'PrecursorCharge', 'Precursor Charge': 'PrecursorCharge',
+    'Charge': 'PrecursorCharge', 'Z': 'PrecursorCharge',
 }
 
 renamed = False
@@ -266,10 +283,10 @@ req_cols = [
 ]
 missing = [c for c in req_cols if c not in df.columns]
 if missing:
-    st.error("**Missing required columns after rename:**")
+    st.error("**Missing required columns:**")
     for c in missing:
         st.write(f"- `{c}`")
-    st.info("Check spelling, case, or extra spaces. See debug above.")
+    st.info("Check case, spaces, or use debug output above.")
     st.stop()
 else:
     st.success("All required columns found!")
@@ -372,7 +389,7 @@ for ax in axes[n_panels:]:
 
 fig.suptitle("Precursor m/z vs Ion Mobility (1/K₀)", fontsize=18)
 st.pyplot(fig)
-plt.close(fig)  # Prevent memory leak
+plt.close(fig)
 
 # ---------------------------------------------------------
 # Download
