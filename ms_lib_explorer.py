@@ -1,12 +1,12 @@
 #############################
 # PASEF MAPPER STREAMLIT #
-# Google Drive + Local Upload
-# FULL VIRUS SCAN BYPASS + AUTO-RENAME
+# FULLY AUTOMATIC GOOGLE DRIVE DOWNLOAD (NO BROWSER)
+# 540 MB+ SUPPORT + AUTO-COLUMN RENAME
 #############################
 import io
 import re
-import csv
 import math
+import csv
 import requests
 import numpy as np
 import pandas as pd
@@ -39,25 +39,24 @@ def extract_drive_file_id(url: str):
     return None
 
 # ---------------------------------------------------------
-# Download from Google Drive (FULL VIRUS SCAN BYPASS)
+# AUTO VIRUS SCAN BYPASS (NO BROWSER NEEDED)
 # ---------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def download_from_google_drive(file_id: str) -> bytes:
-    base_url = "https://drive.google.com/uc"
     session = requests.Session()
+    url = "https://drive.google.com/uc"
 
-    # Step 1: Try direct download
-    response = session.get(base_url, params={"export": "download", "id": file_id}, stream=True)
-    content = response.content
+    # Step 1: Initial request (triggers warning page if large file)
+    resp = session.get(url, params={"export": "download", "id": file_id}, stream=True)
+    text = resp.content.decode('utf-8', errors='ignore')
 
-    # Step 2: Detect virus scan HTML page
-    if b"virus scan warning" in content.lower() or b"uc-download-link" in content:
-        text = content.decode('utf-8', errors='ignore')
-        confirm_match = re.search(r'name="confirm"\s+value="([^"]+)"', text)
-        uuid_match = re.search(r'name="uuid"\s+value="([^"]+)"', text)
+    # Step 2: If virus scan warning → extract confirm token
+    if "virus scan warning" in text.lower() or "download anyway" in text.lower():
+        confirm_match = re.search(r'confirm=([0-9A-Za-z_]+)', text)
+        uuid_match = re.search(r'uuid=([0-9A-Za-z_-]+)', text)
 
         if not confirm_match:
-            raise RuntimeError("Virus scan page detected but no confirm token found.")
+            raise RuntimeError("Virus scan detected but no confirm token found.")
 
         params = {
             "id": file_id,
@@ -67,12 +66,12 @@ def download_from_google_drive(file_id: str) -> bytes:
         if uuid_match:
             params["uuid"] = uuid_match.group(1)
 
-        response = session.get(base_url, params=params, stream=True)
+        resp = session.get(url, params=params, stream=True)
 
-    if response.status_code != 200:
-        raise RuntimeError(f"Download failed: {response.status_code}")
+    if resp.status_code != 200:
+        raise RuntimeError(f"Download failed: {resp.status_code} - {resp.text[:200]}")
 
-    return response.content
+    return resp.content
 
 # ---------------------------------------------------------
 # PASEF / UniMod helper logic
@@ -166,7 +165,7 @@ def plot_panel(ax, data, title, xlim, ylim,
 # UI: Input Method
 # ---------------------------------------------------------
 st.title("PASEF Mapper — Visualize DIA-PASEF Libraries")
-st.write("Supports **local upload (<200 MB)** or **Google Drive (any size)** with **virus scan bypass**.")
+st.write("**Local Upload** (< 200 MB) or **Google Drive (any size)** — **No browser needed**.")
 
 input_method = st.radio(
     "Choose input method:",
@@ -201,12 +200,11 @@ if input_method == "Local Upload (< 200 MB)":
         df = pd.read_csv(io.BytesIO(raw), sep=sep, dtype=dtypes, engine='c')
 
 # -------------------------------
-# 2. Google Drive
+# 2. Google Drive (FULLY AUTOMATIC)
 # -------------------------------
 else:
     gd_link = st.text_input(
-        "Paste **Google Drive shareable link** (Anyone with link → Viewer)\n"
-        "**For large files (>200 MB): Open link → Click 'Download anyway' → Copy NEW URL**",
+        "Paste **original Google Drive shareable link** (Anyone with link → Viewer)",
         placeholder="https://drive.google.com/file/d/.../view"
     )
     if gd_link:
@@ -215,23 +213,17 @@ else:
             st.error("Invalid link. Must contain `/d/FILE_ID/` or `id=FILE_ID`")
             st.stop()
 
-        with st.spinner("Downloading from Google Drive (bypassing virus scan)..."):
+        with st.spinner("Downloading from Google Drive (auto-bypassing virus scan)..."):
             try:
                 file_bytes = download_from_google_drive(file_id)
             except Exception as e:
                 st.error(f"Download failed: {e}")
                 st.stop()
 
-        # BLOCK HTML VIRUS PAGE
-        if b"<!DOCTYPE html>" in file_bytes[:1000] or b"virus scan warning" in file_bytes[:500].lower():
-            st.error("**Blocked**: Google Drive virus scan page received.")
-            st.info("""
-            **How to fix (30 seconds)**:
-            1. Open your link in a browser
-            2. Click **"Download anyway"**
-            3. Wait 2 seconds → Copy the **new URL from address bar**
-            4. Paste that **full URL** here
-            """)
+        # Final safety check
+        if b"<!DOCTYPE html>" in file_bytes[:1000]:
+            st.error("Received HTML page. Virus scan bypass failed.")
+            st.info("Try opening the link in browser → Click 'Download anyway' → Paste new URL.")
             st.stop()
 
         sep = autodetect_sep(file_bytes[:2000])
