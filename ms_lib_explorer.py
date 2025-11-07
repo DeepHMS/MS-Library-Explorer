@@ -1,32 +1,146 @@
 # app.py
 import io
+import os
 import csv
 import math
 import re
+import json
+import time
+import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Polygon
+
 import streamlit as st
 
-st.set_page_config(page_title="PASEF Mapper", layout="wide")
+# Google OAuth / Drive
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import Flow
+from googleapiclient.http import MediaIoBaseDownload
 
-# -------------------------
-# Helpers
-# -------------------------
-def sniff_delimiter(file_bytes: bytes) -> str:
-    # Look at the first kilobyte to guess delimiter
-    head = file_bytes[:1024].decode(errors="ignore")
+# -----------------------------
+# Streamlit Page Config
+# -----------------------------
+st.set_page_config(page_title="PASEF Mapper (Google Drive OAuth)", layout="wide")
+
+# -----------------------------
+# OAuth / Google Drive helpers
+# -----------------------------
+SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+
+def get_client_config_from_secrets():
+    """
+    Expect secrets to contain:
+      [oauth_client]
+      client_id="..."
+      client_secret="..."
+      redirect_uri="https://<your-app-url>/"  # MUST match Cloud console
+    """
+    cc = st.secrets["oauth_client"]
+    client_config = {
+        "web": {
+            "client_id": cc["client_id"],
+            "project_id": cc.get("project_id", "streamlit-oauth"),
+            "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+            "token_uri": "https://oauth2.googleapis.com/token",
+            "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+            "client_secret": cc["client_secret"],
+            "redirect_uris": [cc["redirect_uri"]],
+            "javascript_origins": [cc["redirect_uri"].rstrip("/")],
+        }
+    }
+    return client_config
+
+def build_authorize_url():
+    client_config = get_client_config_from_secrets()
+    flow = Flow.from_client_config(client_config=client_config, scopes=SCOPES)
+    flow.redirect_uri = client_config["web"]["redirect_uris"][0]
+    auth_url, state = flow.authorization_url(
+        access_type="offline",
+        include_granted_scopes="true",
+        prompt="consent"
+    )
+    st.session_state["oauth_state"] = state
+    return auth_url
+
+def exchange_code_for_token(auth_code: str):
+    client_config = get_client_config_from_secrets()
+    flow = Flow.from_client_config(client_config=client_config, scopes=SCOPES, state=st.session_state.get("oauth_state"))
+    flow.redirect_uri = client_config["web"]["redirect_uris"][0]
+    flow.fetch_token(code=auth_code)
+    creds = flow.credentials
+    st.session_state["google_creds"] = {
+        "token": creds.token,
+        "refresh_token": getattr(creds, "refresh_token", None),
+        "token_uri": creds.token_uri,
+        "client_id": creds.client_id,
+        "client_secret": creds.client_secret,
+        "scopes": creds.scopes,
+    }
+
+def get_drive_service():
+    data = st.session_state.get("google_creds")
+    if not data:
+        return None
+    creds = Credentials(
+        token=data["token"],
+        refresh_token=data.get("refresh_token"),
+        token_uri=data["token_uri"],
+        client_id=data["client_id"],
+        client_secret=data["client_secret"],
+        scopes=data["scopes"],
+    )
+    return build("drive", "v3", credentials=creds)
+
+def parse_query_params_for_code():
+    # Handle redirect from Google (code in URL)
+    params = st.query_params
+    if "code" in params:
+        return params["code"]
+    return None
+
+# -----------------------------
+# Drive file utilities
+# -----------------------------
+@st.cache_data(show_spinner=False)
+def drive_download_bytes(file_id: str, meta_fields="id,name,size,mimeType") -> tuple[bytes, dict]:
+    """
+    Chunked download from Google Drive for large files.
+    Returns (content_bytes, metadata_dict)
+    """
+    service = get_drive_service()
+    if service is None:
+        raise RuntimeError("Not authenticated with Google. Please sign in.")
+
+    meta = service.files().get(fileId=file_id, fields=meta_fields).execute()
+    request = service.files().get_media(fileId=file_id)
+
+    buffer = io.BytesIO()
+    downloader = MediaIoBaseDownload(buffer, request, chunksize=10 * 1024 * 1024)  # 10 MB chunks
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+        # You can print progress to server logs if desired.
+
+    return buffer.getvalue(), meta
+
+def autodetect_sep(head_bytes: bytes) -> str:
+    head = head_bytes.decode(errors="ignore")
     return "," if head.count(",") >= head.count("\t") else "\t"
 
-def read_table(uploaded_file) -> pd.DataFrame:
-    raw = uploaded_file.read()
-    if not raw:
-        return pd.DataFrame()
-    sep = sniff_delimiter(raw)
-    return pd.read_csv(io.BytesIO(raw), sep=sep)
+def sniff_sep(content: bytes, user_sep: str | None) -> str:
+    if user_sep in (",", "\t"):
+        return user_sep
+    return autodetect_sep(content[:2000])
 
+def read_table_from_bytes(content: bytes, sep: str) -> pd.DataFrame:
+    return pd.read_csv(io.BytesIO(content), sep=sep)
+
+# -----------------------------
+# PASEF / UniMod logic
+# -----------------------------
 def parse_unimods(df: pd.DataFrame, selected_unimods: set | None = None):
-    """Add UniMod_List and Has_Mod columns (selected_unimods may be empty)."""
     pattern = r"UniMod:(\d+)"
     df = df.copy()
     df["ModifiedPeptideSequence"] = df["ModifiedPeptideSequence"].fillna("")
@@ -35,37 +149,26 @@ def parse_unimods(df: pd.DataFrame, selected_unimods: set | None = None):
     )
     all_unis = sorted({u for x in df["UniMod_List"] for u in x})
     if selected_unimods is None:
-        selected_unimods = set()
+        selected_unimods = set(all_unis)
     df["Has_Mod"] = df["UniMod_List"].apply(lambda x: bool(set(x) & selected_unimods))
     return df, all_unis
 
-def parse_pasef_windows(uploaded_txt, pasef_type: str):
-    """Return (dia_windows, diag_windows) from a .txt file depending on pasef_type."""
+def parse_pasef_windows_txt_bytes(txt_bytes: bytes, pasef_type: str):
     dia_windows, diag_windows = [], []
-    if uploaded_txt is None:
-        return dia_windows, diag_windows
-    txt = uploaded_txt.read().decode(errors="ignore").splitlines()
-    reader = csv.reader(txt)
+    lines = txt_bytes.decode(errors="ignore").splitlines()
+    reader = csv.reader(lines)
     _ = next(reader, None)  # header
     for parts in reader:
         if not parts:
             continue
         if pasef_type == "DIA" and parts[0].strip() == "PASEF":
-            # columns: type, ..., K0_low, K0_high, mz_low, mz_high
-            # indices used below: (2,3,4,5)
             try:
-                dia_windows.append(
-                    (float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5]))
-                )
+                dia_windows.append((float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])))
             except Exception:
                 continue
         elif pasef_type == "DIAGONAL" and parts[0].strip().lower() == "diagonal":
-            # columns: "diagonal", k1, m1_start, m1_end, k2, m2_start
             try:
-                diag_windows.append(
-                    (float(parts[1]), float(parts[2]), float(parts[3]),
-                     float(parts[4]), float(parts[5]))
-                )
+                diag_windows.append((float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), float(parts[5])))
             except Exception:
                 continue
     return dia_windows, diag_windows
@@ -101,7 +204,7 @@ def plot_panel(ax, data, title, xlim, ylim,
                selected_unimods: set,
                overlay, pasef_type, dia_windows, diag_windows):
     data = data.copy()
-    # Background (all or filtered)
+
     if show_nonuni:
         nonu = data[~data["Has_Mod"]] if "Has_Mod" in data.columns else data
         ax.scatter(nonu["PrecursorMz"], nonu["PrecursorIonMobility"],
@@ -121,26 +224,119 @@ def plot_panel(ax, data, title, xlim, ylim,
     ax.set_xlabel("Precursor m/z", fontsize=10)
     ax.set_ylabel("Ion Mobility (1/K0)", fontsize=10)
 
-# -------------------------
-# UI
-# -------------------------
-st.title("m/z vs Ion Mobility — PASEF Mapper (Streamlit)")
+# -----------------------------
+# UI: Title and Auth
+# -----------------------------
+st.title("m/z vs Ion Mobility — PASEF Mapper (Google Drive OAuth per-user)")
 
-left, right = st.columns([1.2, 1])
+# 1) Handle OAuth redirect code (if present)
+code_in_url = parse_query_params_for_code()
+if code_in_url and "google_creds" not in st.session_state:
+    try:
+        exchange_code_for_token(code_in_url)
+        st.success("✅ Google sign-in complete.")
+        # Clean the URL query params
+        st.query_params.clear()
+    except Exception as e:
+        st.error(f"OAuth error: {e}")
 
-with left:
-    st.subheader("1) Upload Method Library")
-    lib_file = st.file_uploader("Upload .csv or .tsv", type=["csv", "tsv"])
-    req_cols = ["ProteinId", "PrecursorMz", "PeptideSequence",
-                "ModifiedPeptideSequence", "PrecursorIonMobility", "PrecursorCharge"]
+# 2) Auth / Sign-in UI
+if "google_creds" not in st.session_state:
+    st.info("Sign in with Google to access **your own Google Drive** files securely.")
+    auth_url = build_authorize_url()
+    st.link_button("🔐 Sign in with Google", auth_url, type="primary")
+    st.stop()
+else:
+    st.success("Signed in with Google Drive ✅")
 
-with right:
-    st.subheader("2) Overlay PASEF Windows (Optional)")
-    overlay = st.checkbox("Overlay PASEF windows", value=False)
-    pasef_type = st.radio("PASEF type", ["DIA", "DIAGONAL"], horizontal=True, disabled=not overlay)
-    win_file = st.file_uploader("Upload PASEF windows .txt", type=["txt"], disabled=not overlay)
+# Build Drive service
+service = get_drive_service()
+if service is None:
+    st.error("Could not initialize Google Drive service. Please sign in again.")
+    st.stop()
 
-st.divider()
+# -----------------------------
+# Controls: Load Library from Drive
+# -----------------------------
+st.header("1) Load Method Library (from your Google Drive)")
+help_txt = "Paste a Google Drive File ID (from a share link) for your large library TSV/CSV."
+lib_col1, lib_col2 = st.columns([2,1])
+with lib_col1:
+    lib_file_id = st.text_input("Google Drive File ID (library)", placeholder="e.g., 1AbCDEFghiJKLmnopQRsTuvWxYz", help=help_txt)
+with lib_col2:
+    sep_choice = st.selectbox("Delimiter", options=["Auto", "Comma (,)", "Tab (\\t)"], index=0)
+
+if lib_file_id:
+    with st.spinner("Downloading library from Drive..."):
+        try:
+            lib_bytes, lib_meta = drive_download_bytes(lib_file_id)
+        except Exception as e:
+            st.error(f"Failed to download library file: {e}")
+            st.stop()
+
+    sep = None
+    if sep_choice == "Comma (,)":
+        sep = ","
+    elif sep_choice == "Tab (\\t)":
+        sep = "\t"
+
+    sep = sniff_sep(lib_bytes, sep)
+    try:
+        df = read_table_from_bytes(lib_bytes, sep)
+    except Exception as e:
+        st.error(f"Failed to parse library as CSV/TSV: {e}")
+        st.stop()
+
+    st.success(f"Library loaded: **{lib_meta.get('name','file')}** — rows: {df.shape[0]:,}, cols: {df.shape[1]}")
+    with st.expander("Preview (head)"):
+        st.dataframe(df.head())
+else:
+    st.warning("Enter a Google Drive File ID for the library to continue.")
+    st.stop()
+
+# -----------------------------
+# Required columns check
+# -----------------------------
+req_cols = ["ProteinId", "PrecursorMz", "PeptideSequence",
+            "ModifiedPeptideSequence", "PrecursorIonMobility", "PrecursorCharge"]
+missing = [c for c in req_cols if c not in df.columns]
+if missing:
+    st.error(f"Missing required columns: {missing}")
+    st.stop()
+
+# -----------------------------
+# PASEF Windows (optional)
+# -----------------------------
+st.header("2) Optional: Overlay PASEF Windows")
+
+overlay = st.checkbox("Overlay PASEF windows", value=False)
+pasef_type = st.radio("PASEF type", ["DIA", "DIAGONAL"], horizontal=True, disabled=not overlay)
+
+dia_windows, diag_windows = [], []
+if overlay:
+    wopt = st.radio("Provide window file via", ["Google Drive (File ID)", "Local upload"], horizontal=True)
+    if wopt == "Google Drive (File ID)":
+        win_id = st.text_input("Google Drive File ID (PASEF windows .txt)")
+        if win_id:
+            with st.spinner("Downloading PASEF windows from Drive..."):
+                try:
+                    w_bytes, w_meta = drive_download_bytes(win_id)
+                except Exception as e:
+                    st.error(f"Failed to download PASEF windows: {e}")
+                    st.stop()
+            dia_windows, diag_windows = parse_pasef_windows_txt_bytes(w_bytes, pasef_type)
+            st.success(f"Loaded window file: **{w_meta.get('name','file')}**")
+    else:
+        up = st.file_uploader("Upload PASEF windows .txt", type=["txt"])
+        if up:
+            w_bytes = up.read()
+            dia_windows, diag_windows = parse_pasef_windows_txt_bytes(w_bytes, pasef_type)
+            st.success(f"Uploaded window file: **{up.name}**")
+
+# -----------------------------
+# Axes and UniMod Controls
+# -----------------------------
+st.header("3) Plot Controls")
 
 c1, c2, c3, c4 = st.columns(4)
 with c1:
@@ -151,33 +347,17 @@ with c3:
     y_min = st.number_input("1/K0 min", value=0.0, step=0.1, format="%.2f")
 with c4:
     y_max = st.number_input("1/K0 max", value=1.90, step=0.05, format="%.2f")
+xlim = (x_min, x_max); ylim = (y_min, y_max)
 
-xlim = (x_min, x_max)
-ylim = (y_min, y_max)
-
-st.subheader("3) UniMod Mapping & Layers")
 map_unimod = st.checkbox("Enable UniMod parsing and highlighting", value=True)
 show_nonuni = st.checkbox("Show non-UniMod layer (grey)", value=True)
 show_unimod = st.checkbox("Show UniMod layer (colored)", value=True)
-merge_uni = st.checkbox("Merge UniMod and non-UniMod together in same panel", value=True,
-                        help="When ON (recommended), both layers render in the same panels. When OFF, only the selected layers render (still in same panels).")
+merge_uni = st.checkbox("Merge UniMod & non-UniMod in same panels (unified view)", value=True,
+                        help="Unified Option 1: both layers in the same panels. Turn OFF to view either layer alone (still unified panels).")
 
-st.info("Option 1 (Unified plot): Toggle UniMod & non-UniMod layers above to show either or both in the same panels.", icon="ℹ️")
-
-# -------------------------
-# Processing
-# -------------------------
-if lib_file is None:
-    st.warning("Please upload a method library file to continue.")
-    st.stop()
-
-df = read_table(lib_file)
-missing = [c for c in req_cols if c not in df.columns]
-if missing:
-    st.error(f"Missing required columns: {missing}")
-    st.stop()
-
-# Unique subsets for plotting
+# -----------------------------
+# Prepare data subsets
+# -----------------------------
 subset1 = ["ProteinId", "PrecursorMz", "PeptideSequence",
            "ModifiedPeptideSequence", "PrecursorIonMobility"]
 df_all = df[subset1].drop_duplicates()
@@ -185,18 +365,14 @@ df_all = df[subset1].drop_duplicates()
 subset2 = subset1 + ["PrecursorCharge"]
 df_chg = df[subset2].drop_duplicates()
 
-# UniMod parse
 selected_unimods = set()
 all_unis = []
 if map_unimod:
     df_all, all_unis = parse_unimods(df_all, None)
     df_chg, _ = parse_unimods(df_chg, None)
-
-    # UniMod selector — default to ALL
     if all_unis:
         uni_sel = st.multiselect("Select UniMod types to highlight (default: ALL)", all_unis, default=all_unis)
         selected_unimods = set(uni_sel)
-        # recompute Has_Mod using selection
         df_all["Has_Mod"] = df_all["UniMod_List"].apply(lambda x: bool(set(x) & selected_unimods))
         df_chg["Has_Mod"] = df_chg["UniMod_List"].apply(lambda x: bool(set(x) & selected_unimods))
     else:
@@ -204,54 +380,45 @@ if map_unimod:
         df_all["Has_Mod"] = False
         df_chg["Has_Mod"] = False
 else:
-    # still need columns for plotting logic
     df_all["UniMod_List"] = [[] for _ in range(len(df_all))]
     df_all["Has_Mod"] = False
     df_chg["UniMod_List"] = [[] for _ in range(len(df_chg))]
     df_chg["Has_Mod"] = False
 
-# PASEF windows
-dia_windows, diag_windows = [], []
-if overlay:
-    dia_windows, diag_windows = parse_pasef_windows(win_file, pasef_type)
-
-# Charges for panels
+# Identify charges; limit to up to 5 to keep 1+5=6 panels like your original
 charges = sorted(df_chg["PrecursorCharge"].dropna().unique())
-# cap total panels to 6 like original layout (1 "All" + up to 5 charges)
 charges_for_panels = charges[:5]
 num_panels = 1 + len(charges_for_panels)
 ncols = 3
 nrows = math.ceil(num_panels / ncols)
 
-# -------------------------
-# Plotting
-# -------------------------
+# -----------------------------
+# Plot
+# -----------------------------
 fig, axes = plt.subplots(nrows=nrows, ncols=ncols, figsize=(6 * ncols, 4 * nrows))
-axes = axes.flatten() if isinstance(axes, (list, tuple, np.ndarray)) else [axes]
+axes = np.array(axes).reshape(-1) if isinstance(axes, np.ndarray) else np.array([axes])
 
-# Panel 1: All precursors (Unique)
+# Panel 1: All
 ax0 = axes[0]
-title0 = "All Precursors (Unique)"
-plot_panel(ax0, df_all, title0, xlim, ylim,
+plot_panel(ax0, df_all, "All Precursors (Unique)", xlim, ylim,
            show_nonuni=show_nonuni or merge_uni,
            show_unimod=show_unimod or merge_uni,
            selected_unimods=selected_unimods,
            overlay=overlay, pasef_type=pasef_type,
            dia_windows=dia_windows, diag_windows=diag_windows)
 
-# Charge-specific panels
+# Charge panels
 for i, ch in enumerate(charges_for_panels, start=1):
     ax = axes[i]
     ch_data = df_chg[df_chg["PrecursorCharge"] == ch]
-    title = f"Charge = {int(ch)}"
-    plot_panel(ax, ch_data, title, xlim, ylim,
+    plot_panel(ax, ch_data, f"Charge = {int(ch)}", xlim, ylim,
                show_nonuni=show_nonuni or merge_uni,
                show_unimod=show_unimod or merge_uni,
                selected_unimods=selected_unimods,
                overlay=overlay, pasef_type=pasef_type,
                dia_windows=dia_windows, diag_windows=diag_windows)
 
-# Hide any unused axes
+# Hide extra axes
 for j in range(1 + len(charges_for_panels), len(axes)):
     axes[j].axis("off")
 
@@ -263,12 +430,12 @@ fig.tight_layout(rect=[0, 0, 1, 0.96])
 
 st.pyplot(fig, clear_figure=True)
 
-# -------------------------
-# Downloads & Summary
-# -------------------------
+# Download button
 buf = io.BytesIO()
 fig.savefig(buf, format="png", dpi=200, bbox_inches="tight")
-st.download_button("Download figure (PNG)", data=buf.getvalue(), file_name="pasef_mapper.png", mime="image/png")
+st.download_button("Download figure (PNG)", data=buf.getvalue(),
+                   file_name="pasef_mapper.png", mime="image/png")
 
+# Summary
 st.caption(f"Detected charges: {', '.join(map(lambda x: str(int(x)), charges)) if len(charges) else 'None'}")
 st.caption(f"Detected UniMods: {', '.join(all_unis) if all_unis else 'None'}")
